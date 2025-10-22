@@ -60,7 +60,8 @@ class MultiChainMonitorService:
                 'entity_deployments': 0,
                 'last_deployment_time': None,
                 'status': 'Initializing',
-                'errors': 0
+                'errors': 0,
+                'current_batch_size': BATCH_SIZE  # 当前使用的批量大小
             } for network in networks if network not in NON_EVM_NETWORKS and network in RPC_ENDPOINTS
         }
         self.stats_lock = threading.Lock()
@@ -210,8 +211,41 @@ class MultiChainMonitorService:
             logger.info(f"[{network}] Starting fresh from current block {current_block}")
             return current_block
 
+    def calculate_dynamic_batch_size(self, network: str, behind: int) -> int:
+        """
+        Calculate dynamic batch size based on how far behind we are
+
+        Args:
+            network: Network name
+            behind: Number of blocks behind
+
+        Returns:
+            Adjusted batch size
+        """
+        base_batch_size = BATCH_SIZE
+
+        # Progressive batch size increase based on behind distance
+        if behind < 100:
+            # Close to real-time, use normal batch size
+            return base_batch_size
+        elif behind < 1000:
+            # Slightly behind, 2x speed
+            return base_batch_size * 2
+        elif behind < 5000:
+            # Moderately behind, 5x speed
+            return base_batch_size * 5
+        elif behind < 10000:
+            # Significantly behind, 10x speed
+            return base_batch_size * 10
+        elif behind < 50000:
+            # Very far behind, 20x speed
+            return base_batch_size * 20
+        else:
+            # Extremely behind, 50x speed (catch up mode)
+            return base_batch_size * 50
+
     def monitor_network(self, network: str):
-        """Monitor a single network with retry mechanism"""
+        """Monitor a single network with retry mechanism and dynamic batch sizing"""
         monitor = self.monitors[network]
         current_block = self.initialize_start_block(network)
         consecutive_errors = 0
@@ -232,9 +266,22 @@ class MultiChainMonitorService:
                         self.stats[network]['latest_block'] = latest_block
 
                 if latest_block > current_block:
-                    end_block = min(current_block + BATCH_SIZE - 1, latest_block)
+                    # Calculate how far behind we are
+                    behind = latest_block - current_block
+
+                    # Dynamically adjust batch size based on behind distance
+                    dynamic_batch_size = self.calculate_dynamic_batch_size(network, behind)
+
+                    end_block = min(current_block + dynamic_batch_size - 1, latest_block)
+                    batch_size_used = end_block - current_block + 1
+
                     start_time = time.time()
-                    logger.info(f"[{network}][{time.strftime('%H:%M:%S')}] Processing blocks {current_block} to {end_block}")
+
+                    # Log with batch size info when using accelerated mode
+                    if dynamic_batch_size > BATCH_SIZE:
+                        logger.info(f"[{network}][{time.strftime('%H:%M:%S')}] CATCH-UP MODE: Processing blocks {current_block} to {end_block} (batch: {batch_size_used}, behind: {behind:,})")
+                    else:
+                        logger.info(f"[{network}][{time.strftime('%H:%M:%S')}] Processing blocks {current_block} to {end_block}")
 
                     deployments = monitor.get_contract_deployments(current_block, end_block)
 
@@ -242,7 +289,8 @@ class MultiChainMonitorService:
                         logger.info(f"[{network}][{time.strftime('%H:%M:%S')}] Found {len(deployments)} contract deployment(s)")
                         self.process_deployments_parallel(deployments, network)
                         elapsed = time.time() - start_time
-                        logger.info(f"[{network}] Batch completed in {elapsed:.2f}s")
+                        blocks_per_sec = batch_size_used / elapsed if elapsed > 0 else 0
+                        logger.info(f"[{network}] Batch completed in {elapsed:.2f}s ({blocks_per_sec:.1f} blocks/s)")
 
                     self.database.update_last_processed_block(network, end_block)
                     current_block = end_block + 1
@@ -250,6 +298,7 @@ class MultiChainMonitorService:
                     with self.stats_lock:
                         if network in self.stats:
                             self.stats[network]['current_block'] = current_block
+                            self.stats[network]['current_batch_size'] = dynamic_batch_size
                     consecutive_errors = 0
 
                 time.sleep(BLOCK_CHECK_INTERVAL)
@@ -298,15 +347,15 @@ class MultiChainMonitorService:
         """Display real-time monitoring status in terminal"""
         import os
         while self.is_running:
-            time.sleep(5)
+            time.sleep(1)
             os.system('clear' if os.name == 'posix' else 'cls')
-            print("=" * 100)
-            print(f"{'Multi-Chain Contract Monitor (Parallel Processing Enabled)'.center(120)}")
-            print(f"{'Updated: ' + time.strftime('%Y-%m-%d %H:%M:%S').center(120)}")
-            print("=" * 120)
+            print("=" * 145)
+            print(f"{'Multi-Chain Contract Monitor (Parallel Processing + Dynamic Speed)'.center(145)}")
+            print(f"{'Updated: ' + time.strftime('%Y-%m-%d %H:%M:%S').center(145)}")
+            print("=" * 145)
             print()
-            print(f"{'Network':<15} {'Status':<20} {'Current':<12} {'Latest':<12} {'Behind':<10} {'Found':<10} {'Saved':<10} {'Entity':<10} {'Errors':<10}")
-            print("-" * 120)
+            print(f"{'Network':<15} {'Status':<20} {'Current':<12} {'Latest':<12} {'Behind':<10} {'Batch':<10} {'Found':<10} {'Saved':<10} {'Entity':<10} {'Errors':<10}")
+            print("-" * 145)
 
             with self.stats_lock:
                 for network in sorted(self.stats.keys()):
@@ -314,22 +363,38 @@ class MultiChainMonitorService:
                     current = stat['current_block']
                     latest = stat['latest_block']
                     behind = latest - current if latest > 0 and current > 0 else 0
+                    batch_size = stat.get('current_batch_size', BATCH_SIZE)
                     status = stat['status']
-                    if 'Running' in status:
-                        status_colored = f"\033[92m{status}\033[0m"
-                    elif 'Error' in status:
-                        status_colored = f"\033[91m{status}\033[0m"
-                    else:
-                        status_colored = f"\033[93m{status}\033[0m"
 
-                    # 计算保存率
+                    # Add speed indicator to status
+                    if 'Running' in status and behind > 100:
+                        multiplier = batch_size // BATCH_SIZE
+                        status = f"{status} [{multiplier}x]"
+
+                    # Color codes: \033[92m (5 chars) + \033[0m (4 chars) = 9 extra chars
+                    # Need to add 9 to the width to compensate
+                    if 'Running' in status or 'x]' in status:
+                        status_colored = f"\033[92m{status:<20}\033[0m"
+                    elif 'Error' in status:
+                        status_colored = f"\033[91m{status:<20}\033[0m"
+                    else:
+                        status_colored = f"\033[93m{status:<20}\033[0m"
+
+                    # Format batch size with acceleration indicator
+                    # Color codes add 9 chars, so adjust width accordingly
+                    if batch_size > BATCH_SIZE:
+                        batch_str = f"\033[93m{batch_size:<10}\033[0m"  # Yellow for accelerated
+                    else:
+                        batch_str = f"{batch_size:<10}"
+
+                    # Calculate save rate
                     saved = stat['saved_deployments']
                     total = stat['total_deployments']
-                    saved_str = f"{saved}" if total == 0 else f"{saved}"
+                    saved_str = f"{saved}"
 
-                    print(f"{network:<15} {status_colored:<29} {current:<12,} {latest:<12,} {behind:<10,} {total:<10} {saved_str:<10} {stat['entity_deployments']:<10} {stat['errors']:<10}")
+                    print(f"{network:<15} {status_colored} {current:<12,} {latest:<12,} {behind:<10,} {batch_str} {total:<10} {saved_str:<10} {stat['entity_deployments']:<10} {stat['errors']:<10}")
 
-            print("-" * 120)
+            print("-" * 145)
             with self.stats_lock:
                 total_deployments = sum(s['total_deployments'] for s in self.stats.values())
                 total_saved = sum(s['saved_deployments'] for s in self.stats.values())
@@ -337,16 +402,18 @@ class MultiChainMonitorService:
                 total_errors = sum(s['errors'] for s in self.stats.values())
                 active_chains = sum(1 for s in self.stats.values() if 'Running' in s['status'])
 
-            # 显示活跃线程
+            # Display active threads
             active_threads = sum(1 for t in self.threads.values() if t and t.is_alive())
 
             save_rate = f"{total_saved*100//total_deployments}%" if total_deployments > 0 else "0%"
             print(f"\n{'Total:':<15} Active Chains: {active_chains}/{len(self.stats)}  |  Found: {total_deployments}  |  Saved: {total_saved} ({save_rate})  |  With Entity: {total_entities}  |  Errors: {total_errors}")
             print()
-            print("🔄 Multi-chain parallel monitoring: Each chain runs in independent thread")
-            print("⚡ Contract analysis: Up to 10 concurrent per chain")
-            print(f"📊 Active monitoring threads: {active_threads}/{len(self.threads)}")
-            print(f"💾 Note: 'Saved' shows unique contracts written to DB, 'Found' includes duplicates")
+            print("Multi-chain parallel monitoring: Each chain runs in independent thread")
+            print("Contract analysis: Up to 10 concurrent per chain")
+            print(f"Active monitoring threads: {active_threads}/{len(self.threads)}")
+            print(f"Dynamic Speed: Batch size auto-adjusts based on 'Behind' value (1x-50x acceleration)")
+            print(f"  < 100 blocks: 1x  |  < 1K: 2x  |  < 5K: 5x  |  < 10K: 10x  |  < 50K: 20x  |  > 50K: 50x")
+            print(f"\nNote: 'Saved' shows unique contracts written to DB, 'Found' includes duplicates")
             print("\nPress Ctrl+C to stop monitoring...")
             print(f"Log file: {LOG_FILE}")
     
