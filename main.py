@@ -1,10 +1,12 @@
 """
 Multi-chain contract monitoring service with retry mechanism and parallel processing
+OPTIMIZED: Async Arkham API calls + Batch DB writes + Caching
 """
 import logging
 import time
 import sys
 import threading
+import asyncio
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -14,7 +16,7 @@ from config import (
     LOG_FILE, LOG_LEVEL, DEFAULT_NETWORKS, NON_EVM_NETWORKS
 )
 from blockchain_monitor import BlockchainMonitor
-from arkham_client import ArkhamClient
+from arkham_client_async import ArkhamClientAsync
 from database import ContractDatabase
 from contract_analyzer import ContractAnalyzer
 
@@ -31,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 class MultiChainMonitorService:
     def __init__(self, networks: List[str], arkham_api_key: str):
-        logger.info("Initializing Multi-Chain Contract Monitor Service")
+        logger.info("Initializing Multi-Chain Contract Monitor Service (OPTIMIZED)")
 
         self.networks = networks
-        self.arkham_client = ArkhamClient(arkham_api_key, ARKHAM_API_URL)
-        self.database = ContractDatabase(DB_PATH)
+        self.arkham_client = ArkhamClientAsync(arkham_api_key, ARKHAM_API_URL)
+        self.database = ContractDatabase(DB_PATH, enable_batch_mode=True)  # 启用批量写入
         self.monitors: Dict[str, BlockchainMonitor] = {}
         self.analyzers: Dict[str, ContractAnalyzer] = {}
         self.threads: Dict[str, threading.Thread] = {}
@@ -44,6 +46,10 @@ class MultiChainMonitorService:
         # 并行处理线程池 - 最多10个并发
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ContractAnalyzer")
         
+        # Event loop for async operations
+        self.loop = None
+        self.loop_thread = None
+
         # 统计数据
         self.stats = {
             network: {
@@ -79,7 +85,7 @@ class MultiChainMonitorService:
                 logger.error(f"✗ Failed to initialize {network} monitor: {e}")
 
     def process_deployment(self, deployment: dict, network: str):
-        """Process a single contract deployment"""
+        """Process a single contract deployment with async API calls"""
         contract_address = deployment['contract_address']
         deployer_address = deployment['deployer_address']
         logger.info(f"[{network}] Processing deployment: {contract_address}")
@@ -89,6 +95,7 @@ class MultiChainMonitorService:
         contract_type = None
         contract_info_json = None
 
+        # Step 1: 合约分析 (同步)
         if analyzer:
             try:
                 contract_info = analyzer.get_contract_info(contract_address)
@@ -116,10 +123,10 @@ class MultiChainMonitorService:
                 logger.error(f"[{network}] Error analyzing contract: {e}")
                 contract_type = 'Error'
 
-        address_info = self.arkham_client.get_address_info(deployer_address, chain=network)
-        entity_name, entity_id = self.arkham_client.extract_entity_info(address_info)
+        # Step 2: Arkham API 调用 (异步) - 在新的 event loop 中运行
+        entity_name, entity_id = self._get_entity_info_sync(deployer_address, network)
 
-        # 保存到数据库，返回是否成功保存（避免重复）
+        # Step 3: 保存到数据库 (批量队列)
         saved = self.database.save_contract(
             contract_address=contract_address,
             network=network,
@@ -137,7 +144,7 @@ class MultiChainMonitorService:
         with self.stats_lock:
             if network in self.stats:
                 self.stats[network]['total_deployments'] += 1
-                if saved:  # 只有成功保存时才计数
+                if saved:
                     self.stats[network]['saved_deployments'] += 1
                 if entity_name:
                     self.stats[network]['entity_deployments'] += 1
@@ -147,6 +154,23 @@ class MultiChainMonitorService:
             logger.info(f"[{network}] ✓ Contract {contract_address} belongs to entity: {entity_name}")
         else:
             logger.info(f"[{network}] ○ Contract {contract_address} - no entity found")
+
+    def _get_entity_info_sync(self, address: str, network: str) -> tuple:
+        """同步包装器，用于在线程池中调用异步 API"""
+        try:
+            # 在新的 event loop 中运行异步操作
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                address_info = loop.run_until_complete(
+                    self.arkham_client.get_address_info(address, chain=network)
+                )
+                return self.arkham_client.extract_entity_info(address_info)
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"[{network}] Error getting entity info: {e}")
+            return None, None
 
     def process_deployments_parallel(self, deployments: List[dict], network: str):
         """并行处理多个合约部署"""
@@ -301,7 +325,7 @@ class MultiChainMonitorService:
                     # 计算保存率
                     saved = stat['saved_deployments']
                     total = stat['total_deployments']
-                    saved_str = f"{saved}" if total == 0 else f"{saved} ({saved*100//total if total > 0 else 0}%)"
+                    saved_str = f"{saved}" if total == 0 else f"{saved}"
 
                     print(f"{network:<15} {status_colored:<29} {current:<12,} {latest:<12,} {behind:<10,} {total:<10} {saved_str:<10} {stat['entity_deployments']:<10} {stat['errors']:<10}")
 
@@ -392,6 +416,24 @@ class MultiChainMonitorService:
             thread.join(timeout=5)
         logger.info("Shutting down thread pool executor...")
         self.executor.shutdown(wait=True, cancel_futures=False)
+
+        # 关闭异步 Arkham 客户端
+        logger.info("Closing Arkham API client...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self.arkham_client.close())
+        finally:
+            loop.close()
+
+        # 关闭数据库（会等待批量写入完成）
+        logger.info("Closing database...")
+        self.database.close()
+
+        # 显示缓存统计
+        cache_stats = self.arkham_client.get_cache_stats()
+        logger.info(f"Arkham API cache stats: {cache_stats}")
+
         logger.info("Multi-Chain Contract Monitor Service stopped")
 
 

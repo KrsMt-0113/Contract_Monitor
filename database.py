@@ -2,17 +2,30 @@
 Database module for storing contract deployment information
 """
 import sqlite3
-from datetime import datetime
 from typing import Optional, List, Dict
 import logging
+import threading
+from queue import Queue, Empty
 
 logger = logging.getLogger(__name__)
 
 
 class ContractDatabase:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, enable_batch_mode: bool = True):
         self.db_path = db_path
+        self.enable_batch_mode = enable_batch_mode
+
+        # 批量写入队列和线程
+        self.write_queue = Queue() if enable_batch_mode else None
+        self.batch_writer_thread = None
+        self.is_running = False
+        self._stats_lock = threading.Lock()
+        self._batch_stats = {'queued': 0, 'written': 0, 'failed': 0}
+
         self.init_database()
+
+        if enable_batch_mode:
+            self._start_batch_writer()
 
     def init_database(self):
         """Initialize database tables"""
@@ -74,6 +87,84 @@ class ContractDatabase:
         conn.close()
         logger.info("Database initialized successfully")
 
+    def _start_batch_writer(self):
+        """启动批量写入线程"""
+        self.is_running = True
+        self.batch_writer_thread = threading.Thread(
+            target=self._batch_write_worker,
+            daemon=True,
+            name="DBBatchWriter"
+        )
+        self.batch_writer_thread.start()
+        logger.info("Batch write worker started")
+
+    def _batch_write_worker(self):
+        """批量写入工作线程 - 每0.5秒或累积10条记录时写入一次"""
+        batch = []
+        batch_size = 10
+        timeout = 0.5  # 500ms
+
+        while self.is_running:
+            try:
+                # 尝试从队列获取数据
+                try:
+                    item = self.write_queue.get(timeout=timeout)
+                    if item is None:  # 停止信号
+                        break
+                    batch.append(item)
+                except Empty:
+                    pass
+
+                # 如果达到批量大小或超时，执行写入
+                if len(batch) >= batch_size or (len(batch) > 0 and self.write_queue.empty()):
+                    self._flush_batch(batch)
+                    batch = []
+
+            except Exception as e:
+                logger.error(f"Error in batch write worker: {e}", exc_info=True)
+                batch = []
+
+        # 停止前写入剩余数据
+        if batch:
+            self._flush_batch(batch)
+        logger.info("Batch write worker stopped")
+
+    def _flush_batch(self, batch: List[tuple]):
+        """批量写入数据库"""
+        if not batch:
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        success_count = 0
+        failed_count = 0
+
+        try:
+            # 使用 executemany 批量插入
+            cursor.executemany('''
+                INSERT OR IGNORE INTO contracts 
+                (contract_address, network, deployer_address, entity_name, entity_id, 
+                 block_number, transaction_hash, contract_type, contract_info, factory_address, deployment_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', batch)
+
+            success_count = cursor.rowcount
+            conn.commit()
+
+            with self._stats_lock:
+                self._batch_stats['written'] += success_count
+
+            logger.debug(f"Batch write completed: {success_count}/{len(batch)} records written")
+
+        except Exception as e:
+            logger.error(f"Error in batch write: {e}")
+            failed_count = len(batch)
+            with self._stats_lock:
+                self._batch_stats['failed'] += failed_count
+        finally:
+            conn.close()
+
     def save_contract(self, contract_address: str, network: str, deployer_address: str,
                      entity_name: Optional[str], entity_id: Optional[str],
                      block_number: int, transaction_hash: str,
@@ -83,8 +174,40 @@ class ContractDatabase:
                      deployment_type: Optional[str] = None) -> bool:
         """
         Save contract deployment information
-        Returns True if saved successfully, False if already exists
+        如果启用批量模式，将数据加入队列；否则立即写入
+        Returns True if queued/saved successfully, False if already exists
         """
+        data = (contract_address, network, deployer_address, entity_name, entity_id,
+                block_number, transaction_hash, contract_type, contract_info, factory_address, deployment_type)
+
+        if self.enable_batch_mode:
+            # 批量模式：加入队列
+            self.write_queue.put(data)
+            with self._stats_lock:
+                self._batch_stats['queued'] += 1
+
+            log_msg = f"[{network}] ⊕ Queued contract {contract_address}"
+            if contract_type:
+                log_msg += f" (Type: {contract_type})"
+            if entity_name:
+                log_msg += f" (Entity: {entity_name})"
+            logger.debug(log_msg)
+            return True
+        else:
+            # 立即写入模式（原有逻辑）
+            return self._save_contract_immediate(contract_address, network, deployer_address,
+                                                 entity_name, entity_id, block_number,
+                                                 transaction_hash, contract_type, contract_info,
+                                                 factory_address, deployment_type)
+
+    def _save_contract_immediate(self, contract_address: str, network: str, deployer_address: str,
+                                 entity_name: Optional[str], entity_id: Optional[str],
+                                 block_number: int, transaction_hash: str,
+                                 contract_type: Optional[str] = None,
+                                 contract_info: Optional[str] = None,
+                                 factory_address: Optional[str] = None,
+                                 deployment_type: Optional[str] = None) -> bool:
+        """立即写入单条记录（原有逻辑）"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -259,4 +382,21 @@ class ContractDatabase:
         conn.close()
 
         return results
+
+    def get_batch_stats(self) -> Dict:
+        """获取批量写入统计信息"""
+        if not self.enable_batch_mode:
+            return {'batch_mode': False}
+        with self._stats_lock:
+            return self._batch_stats.copy()
+
+    def close(self):
+        """关闭数据库和批量写入线程"""
+        if self.enable_batch_mode and self.is_running:
+            logger.info("Stopping batch write worker...")
+            self.is_running = False
+            self.write_queue.put(None)  # 发送停止信号
+            if self.batch_writer_thread:
+                self.batch_writer_thread.join(timeout=5)
+            logger.info(f"Database closed. Final stats: {self.get_batch_stats()}")
 
