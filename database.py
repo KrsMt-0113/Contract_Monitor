@@ -80,8 +80,11 @@ class ContractDatabase:
                      contract_type: Optional[str] = None,
                      contract_info: Optional[str] = None,
                      factory_address: Optional[str] = None,
-                     deployment_type: Optional[str] = None):
-        """Save contract deployment information"""
+                     deployment_type: Optional[str] = None) -> bool:
+        """
+        Save contract deployment information
+        Returns True if saved successfully, False if already exists
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -96,18 +99,20 @@ class ContractDatabase:
             conn.commit()
 
             # Enhanced logging with contract type
-            log_msg = f"[{network}] Saved contract {contract_address}"
+            log_msg = f"[{network}] ✓ Saved contract {contract_address}"
             if contract_type:
                 log_msg += f" (Type: {contract_type})"
             if deployment_type and deployment_type != 'direct':
                 log_msg += f" (Deployment: {deployment_type})"
             if factory_address:
-                log_msg += f" (Factory: {factory_address})"
+                log_msg += f" (Factory: {factory_address[:10]}...)"
             if entity_name:
                 log_msg += f" (Entity: {entity_name})"
             logger.info(log_msg)
+            return True
         except sqlite3.IntegrityError:
-            logger.warning(f"[{network}] Contract {contract_address} already exists in database")
+            logger.debug(f"[{network}] ⊗ Contract {contract_address} already exists in database (skipped)")
+            return False
         finally:
             conn.close()
 

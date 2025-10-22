@@ -50,6 +50,7 @@ class MultiChainMonitorService:
                 'current_block': 0,
                 'latest_block': 0,
                 'total_deployments': 0,
+                'saved_deployments': 0,  # 成功保存到数据库的数量
                 'entity_deployments': 0,
                 'last_deployment_time': None,
                 'status': 'Initializing',
@@ -118,7 +119,8 @@ class MultiChainMonitorService:
         address_info = self.arkham_client.get_address_info(deployer_address, chain=network)
         entity_name, entity_id = self.arkham_client.extract_entity_info(address_info)
 
-        self.database.save_contract(
+        # 保存到数据库，返回是否成功保存（避免重复）
+        saved = self.database.save_contract(
             contract_address=contract_address,
             network=network,
             deployer_address=deployer_address,
@@ -135,6 +137,8 @@ class MultiChainMonitorService:
         with self.stats_lock:
             if network in self.stats:
                 self.stats[network]['total_deployments'] += 1
+                if saved:  # 只有成功保存时才计数
+                    self.stats[network]['saved_deployments'] += 1
                 if entity_name:
                     self.stats[network]['entity_deployments'] += 1
                 self.stats[network]['last_deployment_time'] = int(time.time())
@@ -273,13 +277,13 @@ class MultiChainMonitorService:
             time.sleep(5)
             os.system('clear' if os.name == 'posix' else 'cls')
             print("=" * 100)
-            print(f"{'Multi-Chain Contract Monitor (Parallel Processing Enabled)'.center(100)}")
-            print(f"{'Updated: ' + time.strftime('%Y-%m-%d %H:%M:%S').center(100)}")
-            print("=" * 100)
+            print(f"{'Multi-Chain Contract Monitor (Parallel Processing Enabled)'.center(120)}")
+            print(f"{'Updated: ' + time.strftime('%Y-%m-%d %H:%M:%S').center(120)}")
+            print("=" * 120)
             print()
-            print(f"{'Network':<15} {'Status':<20} {'Current':<12} {'Latest':<12} {'Behind':<10} {'Total':<10} {'Entity':<10} {'Errors':<10}")
-            print("-" * 100)
-            
+            print(f"{'Network':<15} {'Status':<20} {'Current':<12} {'Latest':<12} {'Behind':<10} {'Found':<10} {'Saved':<10} {'Entity':<10} {'Errors':<10}")
+            print("-" * 120)
+
             with self.stats_lock:
                 for network in sorted(self.stats.keys()):
                     stat = self.stats[network]
@@ -293,11 +297,18 @@ class MultiChainMonitorService:
                         status_colored = f"\033[91m{status}\033[0m"
                     else:
                         status_colored = f"\033[93m{status}\033[0m"
-                    print(f"{network:<15} {status_colored:<29} {current:<12,} {latest:<12,} {behind:<10,} {stat['total_deployments']:<10} {stat['entity_deployments']:<10} {stat['errors']:<10}")
-            
-            print("-" * 100)
+
+                    # 计算保存率
+                    saved = stat['saved_deployments']
+                    total = stat['total_deployments']
+                    saved_str = f"{saved}" if total == 0 else f"{saved} ({saved*100//total if total > 0 else 0}%)"
+
+                    print(f"{network:<15} {status_colored:<29} {current:<12,} {latest:<12,} {behind:<10,} {total:<10} {saved_str:<10} {stat['entity_deployments']:<10} {stat['errors']:<10}")
+
+            print("-" * 120)
             with self.stats_lock:
                 total_deployments = sum(s['total_deployments'] for s in self.stats.values())
+                total_saved = sum(s['saved_deployments'] for s in self.stats.values())
                 total_entities = sum(s['entity_deployments'] for s in self.stats.values())
                 total_errors = sum(s['errors'] for s in self.stats.values())
                 active_chains = sum(1 for s in self.stats.values() if 'Running' in s['status'])
@@ -305,11 +316,13 @@ class MultiChainMonitorService:
             # 显示活跃线程
             active_threads = sum(1 for t in self.threads.values() if t and t.is_alive())
 
-            print(f"\n{'Total:':<15} Active Chains: {active_chains}/{len(self.stats)}  |  Deployments: {total_deployments}  |  With Entity: {total_entities}  |  Errors: {total_errors}")
+            save_rate = f"{total_saved*100//total_deployments}%" if total_deployments > 0 else "0%"
+            print(f"\n{'Total:':<15} Active Chains: {active_chains}/{len(self.stats)}  |  Found: {total_deployments}  |  Saved: {total_saved} ({save_rate})  |  With Entity: {total_entities}  |  Errors: {total_errors}")
             print()
             print("🔄 Multi-chain parallel monitoring: Each chain runs in independent thread")
             print("⚡ Contract analysis: Up to 10 concurrent per chain")
             print(f"📊 Active monitoring threads: {active_threads}/{len(self.threads)}")
+            print(f"💾 Note: 'Saved' shows unique contracts written to DB, 'Found' includes duplicates")
             print("\nPress Ctrl+C to stop monitoring...")
             print(f"Log file: {LOG_FILE}")
     

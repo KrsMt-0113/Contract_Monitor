@@ -6,6 +6,7 @@ from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from typing import List, Dict, Union
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class BlockchainMonitor:
     def get_contract_deployments(self, block_number: int, max_retries=3) -> List[Dict]:
         """
         Get all contract deployments in a specific block with retry logic
+        使用批量 trace_block 和并行处理提升性能
 
         Returns:
             List of dictionaries containing deployment information
@@ -122,35 +124,165 @@ class BlockchainMonitor:
                     logger.error(f"[{self.network_name}] Failed to get block {block_number} after {max_retries} attempts: {e}")
                     raise
 
-        # 处理区块中的交易
+        if not block.transactions:
+            return deployments
+
+        # **优化1: 批量获取整个区块的 trace (一次 RPC 调用)**
+        block_traces = self._get_block_traces(block_number)
+
+        # **优化2: 并行获取所有交易的 receipts**
+        receipts_map = self._get_receipts_parallel(block.transactions)
+
+        # **优化3: 并行处理所有交易**
         try:
-            for tx in block.transactions:
-                receipt = self.w3.eth.get_transaction_receipt(tx['hash'])
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = []
+                for tx in block.transactions:
+                    receipt = receipts_map.get(tx['hash'].hex())
+                    if not receipt:
+                        continue
 
-                # 方法1: 直接部署检测 (tx.to is None)
-                if tx['to'] is None and receipt.get('contractAddress'):
-                    deployment = {
-                        'contract_address': receipt['contractAddress'],
-                        'deployer_address': tx['from'],
-                        'transaction_hash': tx['hash'].hex(),
-                        'block_number': block_number,
-                        'network': self.network_name,
-                        'deployment_type': 'direct',
-                        'factory_address': None,
-                        'gas_used': receipt['gasUsed'],
-                        'status': receipt['status']
-                    }
-                    deployments.append(deployment)
-                    logger.info(f"[{self.network_name}] Found direct deployment: {receipt['contractAddress']} "
-                              f"by {tx['from']} in block {block_number}")
+                    # 提交任务到线程池
+                    future = executor.submit(
+                        self._process_single_transaction,
+                        tx, receipt, block_number, block_traces
+                    )
+                    futures.append(future)
 
-                # 方法2: 工厂合约部署检测 (检查 logs 中的新合约地址)
-                elif tx['to'] is not None:
-                    factory_deployments = self._detect_factory_deployments(tx, receipt, block_number)
-                    deployments.extend(factory_deployments)
+                # 收集结果
+                for future in as_completed(futures):
+                    try:
+                        tx_deployments = future.result()
+                        deployments.extend(tx_deployments)
+                    except Exception as e:
+                        logger.error(f"[{self.network_name}] Error processing transaction: {e}")
 
         except Exception as e:
-            logger.error(f"[{self.network_name}] Error processing transactions in block {block_number}: {e}")
+            logger.error(f"[{self.network_name}] Error in parallel processing for block {block_number}: {e}")
+
+        return deployments
+
+    def _get_receipts_parallel(self, transactions: List[Dict], max_workers=10) -> Dict[str, Dict]:
+        """并行获取所有交易的 receipts"""
+        receipts_map = {}
+
+        def get_receipt(tx_hash):
+            try:
+                return tx_hash.hex(), self.w3.eth.get_transaction_receipt(tx_hash)
+            except Exception as e:
+                logger.debug(f"[{self.network_name}] Failed to get receipt for {tx_hash.hex()}: {e}")
+                return tx_hash.hex(), None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(get_receipt, tx['hash']) for tx in transactions]
+
+            for future in as_completed(futures):
+                try:
+                    tx_hash, receipt = future.result()
+                    if receipt:
+                        receipts_map[tx_hash] = receipt
+                except Exception as e:
+                    logger.debug(f"[{self.network_name}] Error getting receipt: {e}")
+
+        return receipts_map
+
+    def _process_single_transaction(self, tx: Dict, receipt: Dict, block_number: int,
+                                    block_traces: Dict) -> List[Dict]:
+        """处理单个交易，返回该交易中的所有部署"""
+        deployments = []
+
+        # 方法1: 直接部署检测 (tx.to is None)
+        if tx['to'] is None and receipt.get('contractAddress'):
+            deployment = {
+                'contract_address': receipt['contractAddress'],
+                'deployer_address': tx['from'],
+                'transaction_hash': tx['hash'].hex(),
+                'block_number': block_number,
+                'network': self.network_name,
+                'deployment_type': 'direct',
+                'factory_address': None,
+                'gas_used': receipt['gasUsed'],
+                'status': receipt['status']
+            }
+            deployments.append(deployment)
+            logger.info(f"[{self.network_name}] Found direct deployment: {receipt['contractAddress']} "
+                      f"by {tx['from'][:10]}... in block {block_number}")
+
+        # 方法2: 工厂合约部署检测 - 使用预先获取的 traces
+        elif tx['to'] is not None:
+            tx_hash = tx['hash'].hex()
+
+            # 优先使用批量获取的 traces
+            if block_traces and tx_hash in block_traces:
+                factory_deployments = self._parse_traces_for_deployments(
+                    block_traces[tx_hash], tx, receipt, block_number
+                )
+                deployments.extend(factory_deployments)
+            else:
+                # 如果批量 trace 失败，使用回退方案
+                factory_deployments = self._fallback_detect_factory_deployments(tx, receipt, block_number)
+                deployments.extend(factory_deployments)
+
+        return deployments
+
+    def _get_block_traces(self, block_number: int) -> Dict:
+        """
+        批量获取整个区块的所有 trace (一次 RPC 调用)
+        相比逐个交易调用 trace_transaction，这能大幅提升性能
+
+        Returns:
+            Dict[tx_hash, List[trace]]: 按交易哈希组织的 trace 数据
+        """
+        try:
+            # 使用 trace_block 一次性获取整个区块的 trace
+            result = self.w3.provider.make_request('trace_block', [hex(block_number)])
+            traces = result.get('result', [])
+
+            # 按交易哈希组织 trace
+            traces_by_tx = {}
+            for trace in traces:
+                tx_hash = trace.get('transactionHash')
+                if tx_hash:
+                    if tx_hash not in traces_by_tx:
+                        traces_by_tx[tx_hash] = []
+                    traces_by_tx[tx_hash].append(trace)
+
+            logger.debug(f"[{self.network_name}] Got traces for {len(traces_by_tx)} transactions in block {block_number}")
+            return traces_by_tx
+
+        except Exception as e:
+            logger.debug(f"[{self.network_name}] trace_block not available for block {block_number}: {e}")
+            return {}
+
+    def _parse_traces_for_deployments(self, traces: List[Dict], tx: Dict, receipt: Dict,
+                                     block_number: int) -> List[Dict]:
+        """从 trace 列表中提取合约部署（使用 trace_block 格式）"""
+        deployments = []
+
+        for trace in traces:
+            if trace.get('type') == 'create':
+                action = trace.get('action', {})
+                result = trace.get('result', {})
+
+                contract_address = result.get('address')
+                if not contract_address:
+                    continue
+
+                deployment = {
+                    'contract_address': contract_address,
+                    'deployer_address': action.get('from'),
+                    'factory_address': tx['to'],
+                    'transaction_hash': tx['hash'].hex(),
+                    'block_number': block_number,
+                    'network': self.network_name,
+                    'deployment_type': 'factory',
+                    'gas_used': result.get('gasUsed', 0),
+                    'status': receipt['status']
+                }
+                deployments.append(deployment)
+
+                logger.info(f"[{self.network_name}] Found factory deployment: {contract_address} "
+                          f"created by {action.get('from')[:10]}... via factory {tx['to'][:10]}...")
 
         return deployments
 
@@ -304,13 +436,14 @@ class BlockchainMonitor:
 
         return deployments
 
-    def get_deployments_in_range(self, start_block: int, end_block: int) -> List[Dict]:
+    def get_deployments_in_range(self, start_block: int, end_block: int, max_workers=5) -> List[Dict]:
         """
-        Get all contract deployments in a range of blocks
+        Get all contract deployments in a range of blocks (并行处理)
 
         Args:
             start_block: Starting block number (inclusive)
             end_block: Ending block number (inclusive)
+            max_workers: 并行处理的最大线程数
 
         Returns:
             List of all deployments found
@@ -318,21 +451,29 @@ class BlockchainMonitor:
         all_deployments = []
         failed_blocks = []
 
-        for block_num in range(start_block, end_block + 1):
-            try:
-                deployments = self.get_contract_deployments(block_num)
-                all_deployments.extend(deployments)
+        # **并行处理多个区块**
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有区块的处理任务
+            future_to_block = {
+                executor.submit(self.get_contract_deployments, block_num): block_num
+                for block_num in range(start_block, end_block + 1)
+            }
 
-                # Add a small delay to avoid overwhelming the RPC endpoint
-                time.sleep(0.1)
-
-            except Exception as e:
-                logger.error(f"[{self.network_name}] Error processing block {block_num}: {e}")
-                failed_blocks.append(block_num)
-                continue
+            # 收集结果
+            for future in as_completed(future_to_block):
+                block_num = future_to_block[future]
+                try:
+                    deployments = future.result()
+                    all_deployments.extend(deployments)
+                except Exception as e:
+                    logger.error(f"[{self.network_name}] Error processing block {block_num}: {e}")
+                    failed_blocks.append(block_num)
 
         if failed_blocks:
             logger.warning(f"[{self.network_name}] Failed to process {len(failed_blocks)} block(s): {failed_blocks}")
+
+        # 按区块号排序结果
+        all_deployments.sort(key=lambda x: x['block_number'])
 
         return all_deployments
 
