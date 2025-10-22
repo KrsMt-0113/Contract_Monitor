@@ -494,3 +494,45 @@ class BlockchainMonitor:
 
         return all_deployments
 
+    def stream_deployments_in_range(self, start_block: int, end_block: int,
+                                     deployment_queue, max_workers=10):
+        """
+        流式处理区块范围，将部署结果实时推送到队列（生产者模式）
+        这样可以边获取区块边处理，消除串行等待
+
+        Args:
+            start_block: Starting block number (inclusive)
+            end_block: Ending block number (inclusive)
+            deployment_queue: Queue to push deployment results to
+            max_workers: Maximum number of parallel block processing workers
+        """
+        def process_single_block(block_num):
+            """处理单个区块并将结果推入队列"""
+            try:
+                deployments = self.get_contract_deployments(block_num)
+
+                # 将每个部署推送到队列
+                for deployment in deployments:
+                    deployment_queue.put(('deployment', deployment))
+
+                # 推送进度更新
+                deployment_queue.put(('block_processed', (self.network_name, block_num)))
+
+            except Exception as e:
+                logger.error(f"[{self.network_name}] Error processing block {block_num}: {e}")
+                deployment_queue.put(('error', (self.network_name, block_num, str(e))))
+
+        # 并行处理所有区块
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(process_single_block, block_num)
+                for block_num in range(start_block, end_block + 1)
+            ]
+
+            # 等待所有任务完成
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"[{self.network_name}] Block processing task failed: {e}")
+

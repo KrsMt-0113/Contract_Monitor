@@ -1,6 +1,6 @@
 """
 Multi-chain contract monitoring service with retry mechanism and parallel processing
-OPTIMIZED: Async Arkham API calls + Batch DB writes + Caching
+OPTIMIZED: Async Arkham API calls + Batch DB writes + Caching + Pipeline Processing
 """
 import logging
 import time
@@ -9,6 +9,7 @@ import threading
 import asyncio
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
 
 from config import (
     RPC_ENDPOINTS, ARKHAM_API_KEY, ARKHAM_API_URL,
@@ -33,11 +34,11 @@ logger = logging.getLogger(__name__)
 
 class MultiChainMonitorService:
     def __init__(self, networks: List[str], arkham_api_key: str):
-        logger.info("Initializing Multi-Chain Contract Monitor Service (OPTIMIZED)")
+        logger.info("Initializing Multi-Chain Contract Monitor Service (OPTIMIZED + PIPELINE)")
 
         self.networks = networks
         self.arkham_client = ArkhamClientAsync(arkham_api_key, ARKHAM_API_URL)
-        self.database = ContractDatabase(DB_PATH, enable_batch_mode=True)  # 启用批量写入
+        self.database = ContractDatabase(DB_PATH, enable_batch_mode=True)
         self.monitors: Dict[str, BlockchainMonitor] = {}
         self.analyzers: Dict[str, ContractAnalyzer] = {}
         self.threads: Dict[str, threading.Thread] = {}
@@ -46,9 +47,9 @@ class MultiChainMonitorService:
         # 并行处理线程池 - 最多10个并发
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ContractAnalyzer")
         
-        # Event loop for async operations
-        self.loop = None
-        self.loop_thread = None
+        # Pipeline processing: deployment queue for each network
+        self.deployment_queues: Dict[str, Queue] = {}
+        self.processor_threads: Dict[str, threading.Thread] = {}
 
         # 统计数据
         self.stats = {
@@ -56,12 +57,13 @@ class MultiChainMonitorService:
                 'current_block': 0,
                 'latest_block': 0,
                 'total_deployments': 0,
-                'saved_deployments': 0,  # 成功保存到数据库的数量
+                'saved_deployments': 0,
                 'entity_deployments': 0,
                 'last_deployment_time': None,
                 'status': 'Initializing',
                 'errors': 0,
-                'current_batch_size': BATCH_SIZE  # 当前使用的批量大小
+                'current_batch_size': BATCH_SIZE,
+                'queue_size': 0  # 队列中待处理的部署数量
             } for network in networks if network not in NON_EVM_NETWORKS and network in RPC_ENDPOINTS
         }
         self.stats_lock = threading.Lock()
@@ -211,6 +213,65 @@ class MultiChainMonitorService:
             logger.info(f"[{network}] Starting fresh from current block {current_block}")
             return current_block
 
+    def _deployment_processor_worker(self, network: str):
+        """
+        部署处理工作线程（消费者）
+        从队列中获取部署数据并处理，与区块获取并行运行
+        """
+        queue = self.deployment_queues[network]
+        logger.info(f"[{network}] Deployment processor worker started")
+
+        while self.is_running:
+            try:
+                # 从队列获取数据，超时1秒以便检查 is_running
+                try:
+                    item = queue.get(timeout=1)
+                except Empty:
+                    continue
+
+                if item is None:  # 退出信号
+                    break
+
+                msg_type, data = item
+
+                if msg_type == 'deployment':
+                    # 处理单个部署
+                    try:
+                        self.process_deployment(data, network)
+                    except Exception as e:
+                        logger.error(f"[{network}] Error processing deployment: {e}")
+                        with self.stats_lock:
+                            if network in self.stats:
+                                self.stats[network]['errors'] += 1
+
+                elif msg_type == 'block_processed':
+                    # 更新已处理的区块进度
+                    _, block_num = data
+                    self.database.update_last_processed_block(network, block_num)
+                    with self.stats_lock:
+                        if network in self.stats:
+                            self.stats[network]['current_block'] = block_num
+
+                elif msg_type == 'error':
+                    # 记录错误
+                    _, block_num, error_msg = data
+                    logger.error(f"[{network}] Block {block_num} processing error: {error_msg}")
+                    with self.stats_lock:
+                        if network in self.stats:
+                            self.stats[network]['errors'] += 1
+
+                queue.task_done()
+
+                # 更新队列大小统计
+                with self.stats_lock:
+                    if network in self.stats:
+                        self.stats[network]['queue_size'] = queue.qsize()
+
+            except Exception as e:
+                logger.error(f"[{network}] Deployment processor error: {e}")
+
+        logger.info(f"[{network}] Deployment processor worker stopped")
+
     def calculate_dynamic_batch_size(self, network: str, behind: int) -> int:
         """
         Calculate dynamic batch size based on how far behind we are
@@ -245,13 +306,24 @@ class MultiChainMonitorService:
             return base_batch_size * 50
 
     def monitor_network(self, network: str):
-        """Monitor a single network with retry mechanism and dynamic batch sizing"""
+        """Monitor a single network with retry mechanism and pipeline processing"""
         monitor = self.monitors[network]
         current_block = self.initialize_start_block(network)
         consecutive_errors = 0
         max_consecutive_errors = 5
 
-        logger.info(f"[{network}] Monitoring started")
+        logger.info(f"[{network}] Monitoring started with pipeline processing")
+
+        # 创建该网络的部署队列和处理线程
+        self.deployment_queues[network] = Queue(maxsize=1000)
+        processor_thread = threading.Thread(
+            target=self._deployment_processor_worker,
+            args=(network,),
+            name=f"Processor-{network}",
+            daemon=True
+        )
+        processor_thread.start()
+        self.processor_threads[network] = processor_thread
 
         with self.stats_lock:
             if network in self.stats:
@@ -283,65 +355,53 @@ class MultiChainMonitorService:
                     else:
                         logger.info(f"[{network}][{time.strftime('%H:%M:%S')}] Processing blocks {current_block} to {end_block}")
 
-                    deployments = monitor.get_contract_deployments(current_block, end_block)
+                    # PIPELINE PROCESSING: Stream deployments to queue instead of waiting
+                    # This allows block fetching and deployment processing to run in parallel
+                    monitor.stream_deployments_in_range(
+                        current_block,
+                        end_block,
+                        self.deployment_queues[network],
+                        max_workers=min(10, batch_size_used)  # Scale workers with batch size
+                    )
 
-                    if deployments:
-                        logger.info(f"[{network}][{time.strftime('%H:%M:%S')}] Found {len(deployments)} contract deployment(s)")
-                        self.process_deployments_parallel(deployments, network)
-                        elapsed = time.time() - start_time
-                        blocks_per_sec = batch_size_used / elapsed if elapsed > 0 else 0
-                        logger.info(f"[{network}] Batch completed in {elapsed:.2f}s ({blocks_per_sec:.1f} blocks/s)")
+                    elapsed = time.time() - start_time
+                    blocks_per_sec = batch_size_used / elapsed if elapsed > 0 else 0
+                    logger.info(f"[{network}] Batch fetched in {elapsed:.2f}s ({blocks_per_sec:.1f} blocks/s) - processing in background")
 
-                    self.database.update_last_processed_block(network, end_block)
+                    # Update current block immediately, don't wait for processing
                     current_block = end_block + 1
-                    
+
                     with self.stats_lock:
                         if network in self.stats:
-                            self.stats[network]['current_block'] = current_block
                             self.stats[network]['current_batch_size'] = dynamic_batch_size
                     consecutive_errors = 0
 
-                time.sleep(BLOCK_CHECK_INTERVAL)
-
-            except ConnectionError as e:
-                consecutive_errors += 1
-                logger.error(f"[{network}] Connection error (#{consecutive_errors}): {e}")
-                with self.stats_lock:
-                    if network in self.stats:
-                        self.stats[network]['errors'] += 1
-                        self.stats[network]['status'] = f'Error (#{consecutive_errors})'
-                
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.critical(f"[{network}] Too many consecutive connection errors. Attempting reinitialization...")
-                    try:
-                        monitor = BlockchainMonitor(RPC_ENDPOINTS[network], network)
-                        self.monitors[network] = monitor
-                        analyzer = ContractAnalyzer(monitor.w3)
-                        self.analyzers[network] = analyzer
-                        consecutive_errors = 0
-                        logger.info(f"[{network}] Monitor reinitialized successfully")
-                        with self.stats_lock:
-                            if network in self.stats:
-                                self.stats[network]['status'] = 'Running'
-                    except Exception as reinit_error:
-                        logger.critical(f"[{network}] Failed to reinitialize monitor: {reinit_error}")
-                        sleep_time = min(300, BLOCK_CHECK_INTERVAL * (2 ** min(consecutive_errors, 8)))
-                        time.sleep(sleep_time)
                 else:
-                    sleep_time = BLOCK_CHECK_INTERVAL * (2 ** min(consecutive_errors - 1, 5))
-                    time.sleep(sleep_time)
-                    
+                    time.sleep(BLOCK_CHECK_INTERVAL)
+
+            except KeyboardInterrupt:
+                logger.info(f"[{network}] Received interrupt signal")
+                break
             except Exception as e:
                 consecutive_errors += 1
-                logger.error(f"[{network}] Unexpected error (#{consecutive_errors}): {e}", exc_info=True)
+                logger.error(f"[{network}] Error in monitoring loop (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
+
                 with self.stats_lock:
                     if network in self.stats:
+                        self.stats[network]['status'] = f'Error ({consecutive_errors})'
                         self.stats[network]['errors'] += 1
-                        self.stats[network]['status'] = f'Error (#{consecutive_errors})'
-                sleep_time = min(300, BLOCK_CHECK_INTERVAL * (2 ** min(consecutive_errors - 1, 5)))
-                time.sleep(sleep_time)
+
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"[{network}] Too many consecutive errors, stopping monitor")
+                    with self.stats_lock:
+                        if network in self.stats:
+                            self.stats[network]['status'] = 'Failed'
+                    break
+
+                time.sleep(min(60, 5 * (2 ** consecutive_errors)))
 
         logger.info(f"[{network}] Monitoring stopped")
+
 
     def display_status(self):
         """Display real-time monitoring status in terminal"""
@@ -475,12 +535,31 @@ class MultiChainMonitorService:
             self.stop()
 
     def stop(self):
-        """Stop the monitoring service"""
+        """Stop the monitoring service and flush all queues"""
         logger.info("Stopping all monitors...")
         self.is_running = False
+
+        # Wait for monitoring threads to stop
         for network, thread in self.threads.items():
-            logger.info(f"[{network}] Waiting for thread to stop...")
+            logger.info(f"[{network}] Waiting for monitoring thread to stop...")
             thread.join(timeout=5)
+
+        # Wait for all queues to be processed
+        logger.info("Waiting for all deployment queues to be processed...")
+        for network, queue in self.deployment_queues.items():
+            logger.info(f"[{network}] Queue size: {queue.qsize()} - waiting to flush...")
+            queue.join()  # Wait for all items to be processed
+
+        # Send stop signal to all processor threads
+        logger.info("Stopping deployment processor threads...")
+        for network, queue in self.deployment_queues.items():
+            queue.put(None)  # Send stop signal
+
+        # Wait for processor threads to stop
+        for network, thread in self.processor_threads.items():
+            logger.info(f"[{network}] Waiting for processor thread to stop...")
+            thread.join(timeout=10)
+
         logger.info("Shutting down thread pool executor...")
         self.executor.shutdown(wait=True, cancel_futures=False)
 
