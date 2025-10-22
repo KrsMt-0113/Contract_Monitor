@@ -155,22 +155,114 @@ class BlockchainMonitor:
         return deployments
 
     def _detect_factory_deployments(self, tx: Dict, receipt: Dict, block_number: int) -> List[Dict]:
-        """检测工厂合约创建的子合约"""
+        """通过内部交易检测工厂合约创建的子合约"""
+        deployments = []
+
+        try:
+            # 使用 debug_traceTransaction 或 trace_transaction 获取内部交易
+            # 注意：需要 RPC 节点支持 trace 或 debug API
+            try:
+                # 方法1: Parity/OpenEthereum trace API (推荐)
+                traces = self.w3.provider.make_request('trace_transaction', [tx['hash'].hex()])
+
+                for trace in traces.get('result', []):
+                    # 检查是否为 CREATE 或 CREATE2 操作
+                    if trace.get('type') == 'create':
+                        action = trace.get('action', {})
+                        result = trace.get('result', {})
+
+                        contract_address = result.get('address')
+                        if not contract_address:
+                            continue
+
+                        deployment = {
+                            'contract_address': contract_address,
+                            'deployer_address': action.get('from'),  # 实际创建者
+                            'factory_address': tx['to'],  # 工厂合约
+                            'transaction_hash': tx['hash'].hex(),
+                            'block_number': block_number,
+                            'network': self.network_name,
+                            'deployment_type': 'factory',
+                            'gas_used': result.get('gasUsed', 0),
+                            'status': receipt['status'],
+                            'init_code': action.get('init', '')[:20] + '...'  # 记录部分初始化代码
+                        }
+                        deployments.append(deployment)
+
+                        logger.info(f"[{self.network_name}] Found factory deployment via trace: {contract_address} "
+                                  f"created by {action.get('from')[:10]}... via factory {tx['to'][:10]}...")
+
+            except Exception as e:
+                # 如果 trace API 不可用，尝试使用 debug API
+                logger.debug(f"[{self.network_name}] trace_transaction not available, trying debug_traceTransaction: {e}")
+
+                try:
+                    # 方法2: Geth debug API (较慢但更通用)
+                    trace = self.w3.provider.make_request('debug_traceTransaction',
+                                                          [tx['hash'].hex(),
+                                                           {'tracer': 'callTracer'}])
+
+                    deployments.extend(self._parse_call_trace(trace.get('result', {}), tx, receipt, block_number))
+
+                except Exception as e2:
+                    logger.debug(f"[{self.network_name}] debug_traceTransaction also failed: {e2}")
+                    # 如果两种方法都不可用，回退到原来的方法
+                    return self._fallback_detect_factory_deployments(tx, receipt, block_number)
+
+        except Exception as e:
+            logger.error(f"[{self.network_name}] Error in trace-based factory detection: {e}")
+
+        return deployments
+
+    def _parse_call_trace(self, call_trace: Dict, tx: Dict, receipt: Dict, block_number: int) -> List[Dict]:
+        """解析 callTracer 格式的追踪数据"""
+        deployments = []
+
+        def extract_creates(trace: Dict, parent_address: str = None):
+            """递归提取 CREATE 操作"""
+            call_type = trace.get('type', '').upper()
+
+            if call_type in ['CREATE', 'CREATE2']:
+                contract_address = trace.get('to')
+                if contract_address:
+                    deployment = {
+                        'contract_address': contract_address,
+                        'deployer_address': trace.get('from'),
+                        'factory_address': parent_address or tx['to'],
+                        'transaction_hash': tx['hash'].hex(),
+                        'block_number': block_number,
+                        'network': self.network_name,
+                        'deployment_type': 'factory',
+                        'gas_used': int(trace.get('gasUsed', '0x0'), 16) if isinstance(trace.get('gasUsed'), str) else trace.get('gasUsed', 0),
+                        'status': receipt['status']
+                    }
+                    deployments.append(deployment)
+
+                    logger.info(f"[{self.network_name}] Found {call_type} deployment: {contract_address} "
+                              f"by {trace.get('from')[:10]}...")
+
+            # 递归处理子调用
+            for call in trace.get('calls', []):
+                extract_creates(call, trace.get('to'))
+
+        extract_creates(call_trace)
+        return deployments
+
+    def _fallback_detect_factory_deployments(self, tx: Dict, receipt: Dict, block_number: int) -> List[Dict]:
+        """回退方案：当 trace API 不可用时使用"""
+        # 这里放你原来的基于 logs 和字节码检查的实现
         deployments = []
         seen_addresses = set()
 
-        # 预编译合约和零地址列表
         SKIP_ADDRESSES = {
             '0x0000000000000000000000000000000000000000',
             *[f'0x000000000000000000000000000000000000000{i}' for i in range(1, 20)]
         }
 
         try:
-            # 收集所有在 logs 中出现的新地址
             for log in receipt.get('logs', []):
                 address = log['address']
 
-                # 跳过已处理地址、交易目标地址和特殊地址
                 if (address in seen_addresses or
                     address == tx['to'] or
                     address in SKIP_ADDRESSES):
@@ -178,13 +270,18 @@ class BlockchainMonitor:
 
                 seen_addresses.add(address)
 
-                # 检查是否为合约地址（有字节码）
                 try:
                     code = self.w3.eth.get_code(address)
                     if not code or code == b'\x00' or len(code) <= 2:
                         continue
 
-                    # 这是一个新部署的合约
+                    try:
+                        previous_code = self.w3.eth.get_code(address, block_identifier=block_number - 1)
+                        if previous_code and len(previous_code) > 2:
+                            continue
+                    except Exception:
+                        pass
+
                     deployment = {
                         'contract_address': address,
                         'deployer_address': tx['from'],
@@ -198,15 +295,12 @@ class BlockchainMonitor:
                     }
                     deployments.append(deployment)
 
-                    logger.info(f"[{self.network_name}] Found factory deployment: {address} "
-                              f"via factory {tx['to'][:10]}... (caller: {tx['from'][:10]}...)")
-
                 except Exception as e:
                     logger.debug(f"[{self.network_name}] Error checking address {address}: {e}")
                     continue
 
         except Exception as e:
-            logger.debug(f"[{self.network_name}] Error in factory detection: {e}")
+            logger.debug(f"[{self.network_name}] Error in fallback factory detection: {e}")
 
         return deployments
 
