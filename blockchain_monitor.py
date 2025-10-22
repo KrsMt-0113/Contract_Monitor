@@ -238,12 +238,18 @@ class BlockchainMonitor:
             result = self.w3.provider.make_request('trace_block', [hex(block_number)])
             traces = result.get('result', [])
 
+            if not traces:
+                logger.debug(f"[{self.network_name}] No traces found for block {block_number}")
+                return {}
+
             # 按交易哈希组织 trace
             traces_by_tx = {}
             for trace in traces:
                 tx_hash = trace.get('transactionHash')
                 if tx_hash:
-                    if tx_hash not in traces_by_tx:
+                    tx_hash_str = tx_hash if isinstance(tx_hash, str) else tx_hash.hex()
+
+                    if tx_hash_str not in traces_by_tx:
                         traces_by_tx[tx_hash] = []
                     traces_by_tx[tx_hash].append(trace)
 
@@ -251,7 +257,15 @@ class BlockchainMonitor:
             return traces_by_tx
 
         except Exception as e:
-            logger.debug(f"[{self.network_name}] trace_block not available for block {block_number}: {e}")
+        # ⚠️ 这里应该区分不同的错误类型
+            error_msg = str(e).lower()
+
+        # 如果是 method not found,说明节点不支持 trace_block
+            if 'method not found' in error_msg or 'not supported' in error_msg:
+                logger.debug(f"[{self.network_name}] trace_block not supported by RPC node")
+            else:
+                logger.warning(f"[{self.network_name}] trace_block failed for block {block_number}: {e}")
+
             return {}
 
     def _parse_traces_for_deployments(self, traces: List[Dict], tx: Dict, receipt: Dict,
