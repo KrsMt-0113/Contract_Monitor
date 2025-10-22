@@ -214,11 +214,13 @@ class BlockchainMonitor:
 
             # 优先使用批量获取的 traces
             if block_traces and tx_hash in block_traces:
+                logger.info(f"[{self.network_name}] 🔍 Using trace_block for tx {tx_hash[:10]}...")
                 factory_deployments = self._parse_traces_for_deployments(
                     block_traces[tx_hash], tx, receipt, block_number
                 )
                 deployments.extend(factory_deployments)
             else:
+                logger.info(f"[{self.network_name}] ⚠️  Tx {tx_hash[:10]}... not in block_traces (total: {len(block_traces)}), using fallback")
                 # 如果批量 trace 失败，使用回退方案
                 factory_deployments = self._fallback_detect_factory_deployments(tx, receipt, block_number)
                 deployments.extend(factory_deployments)
@@ -234,12 +236,13 @@ class BlockchainMonitor:
             Dict[tx_hash, List[trace]]: 按交易哈希组织的 trace 数据
         """
         try:
+            logger.info(f"[{self.network_name}] Attempting trace_block for block {block_number}")
             # 使用 trace_block 一次性获取整个区块的 trace
             result = self.w3.provider.make_request('trace_block', [hex(block_number)])
             traces = result.get('result', [])
 
             if not traces:
-                logger.debug(f"[{self.network_name}] No traces found for block {block_number}")
+                logger.info(f"[{self.network_name}] No traces found for block {block_number}")
                 return {}
 
             # 按交易哈希组织 trace
@@ -253,7 +256,7 @@ class BlockchainMonitor:
                         traces_by_tx[tx_hash] = []
                     traces_by_tx[tx_hash].append(trace)
 
-            logger.debug(f"[{self.network_name}] Got traces for {len(traces_by_tx)} transactions in block {block_number}")
+            logger.info(f"[{self.network_name}] Got traces for {len(traces_by_tx)} transactions in block {block_number}")
             return traces_by_tx
 
         except Exception as e:
@@ -262,7 +265,7 @@ class BlockchainMonitor:
 
         # 如果是 method not found,说明节点不支持 trace_block
             if 'method not found' in error_msg or 'not supported' in error_msg:
-                logger.debug(f"[{self.network_name}] trace_block not supported by RPC node")
+                logger.warning(f"[{self.network_name}] trace_block not supported by RPC node")
             else:
                 logger.warning(f"[{self.network_name}] trace_block failed for block {block_number}: {e}")
 
